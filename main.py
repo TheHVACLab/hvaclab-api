@@ -1,13 +1,30 @@
-from fastapi import FastAPI
+# =========================
+# BACKEND (FastAPI) - FIXED
+# =========================
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psychrolib
+import logging
 
 psychrolib.SetUnitSystem(psychrolib.SI)
 
 app = FastAPI()
 
-P_ATM = 101325  # Pa
+# Logging
+logging.basicConfig(level=logging.INFO)
 
+# CORS (IMPORTANT)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+P_ATM = 101325  # Pa
 
 # -----------------------------
 # INPUT MODELS
@@ -16,14 +33,12 @@ class PsychroInput(BaseModel):
     db: float
     rh: float
 
-
 class CoolingInput(BaseModel):
     cfm: float
     ra_db: float
     ra_rh: float
     sa_db: float
     sa_rh: float
-
 
 class MixingInput(BaseModel):
     total_cfm: float
@@ -33,15 +48,24 @@ class MixingInput(BaseModel):
     fa_db: float
     fa_rh: float
 
+# -----------------------------
+# HEALTH CHECK
+# -----------------------------
+@app.get("/")
+def home():
+    return {"status": "HVAC API running"}
 
 # -----------------------------
 # COMMON CALC
 # -----------------------------
 def calc_air(Tdb, RH):
+    if RH < 0 or RH > 100:
+        raise HTTPException(status_code=400, detail="RH must be 0-100")
+
     RH = RH / 100
 
     W = psychrolib.GetHumRatioFromRelHum(Tdb, RH, P_ATM)
-    h = psychrolib.GetMoistAirEnthalpy(Tdb, W) / 1000  # kJ/kg
+    h = psychrolib.GetMoistAirEnthalpy(Tdb, W) / 1000
     wb = psychrolib.GetTWetBulbFromRelHum(Tdb, RH, P_ATM)
     dp = psychrolib.GetTDewPointFromRelHum(Tdb, RH)
     v = psychrolib.GetMoistAirVolume(Tdb, W, P_ATM)
@@ -57,7 +81,6 @@ def calc_air(Tdb, RH):
         "rho": round(rho, 3),
     }
 
-
 # -----------------------------
 # TAB 1
 # -----------------------------
@@ -65,22 +88,22 @@ def calc_air(Tdb, RH):
 def psychro(data: PsychroInput):
     return calc_air(data.db, data.rh)
 
-
 # -----------------------------
-# TAB 2 (Cooling Analysis)
+# TAB 2
 # -----------------------------
 @app.post("/cooling")
 def cooling(data: CoolingInput):
 
+    if data.cfm <= 0:
+        raise HTTPException(status_code=400, detail="Invalid airflow")
+
     ra = calc_air(data.ra_db, data.ra_rh)
     sa = calc_air(data.sa_db, data.sa_rh)
 
-    # Convert CFM → m³/s
     m3s = data.cfm * 0.000471947
 
-    # Use RA density
-    rho = ra["rho"]
-    m_dot = rho * m3s  # kg/s
+    rho = (ra["rho"] + sa["rho"]) / 2
+    m_dot = rho * m3s
 
     h1 = ra["h"]
     h2 = sa["h"]
@@ -88,18 +111,15 @@ def cooling(data: CoolingInput):
     W1 = ra["w"]
     W2 = sa["w"]
 
-    # Total load (kW)
     Qt = m_dot * (h1 - h2)
 
-    # Sensible load (kW)
-    Qs = m_dot * 1.02 * (data.ra_db - data.sa_db)
+    cp_air = 1.005
+    Qs = m_dot * cp_air * (data.ra_db - data.sa_db)
 
-    # Latent load
     Ql = Qt - Qs
 
     SHR = Qs / Qt if Qt != 0 else 0
 
-    # Condensate (kg/hr)
     m_cond = m_dot * (W1 - W2) * 3600
 
     return {
@@ -112,25 +132,28 @@ def cooling(data: CoolingInput):
         "dt": round(data.ra_db - data.sa_db, 2),
         "dh": round(h1 - h2, 2),
 
-        # RA
         "ra_wb": ra["wb"],
         "ra_dp": ra["dp"],
         "ra_w": ra["w"],
         "ra_h": ra["h"],
 
-        # SA
         "sa_wb": sa["wb"],
         "sa_dp": sa["dp"],
         "sa_w": sa["w"],
         "sa_h": sa["h"],
     }
 
-
 # -----------------------------
-# TAB 3 (Mixing)
+# TAB 3
 # -----------------------------
 @app.post("/mixing")
 def mixing(data: MixingInput):
+
+    if data.total_cfm <= 0:
+        raise HTTPException(status_code=400, detail="Invalid airflow")
+
+    if data.fa_pct < 0 or data.fa_pct > 100:
+        raise HTTPException(status_code=400, detail="FA% must be 0-100")
 
     ra = calc_air(data.ra_db, data.ra_rh)
     fa = calc_air(data.fa_db, data.fa_rh)
@@ -138,15 +161,12 @@ def mixing(data: MixingInput):
     fa_frac = data.fa_pct / 100
     ra_frac = 1 - fa_frac
 
-    # Airflow split
     fa_cfm = data.total_cfm * fa_frac
     ra_cfm = data.total_cfm * ra_frac
 
-    # Mixing (enthalpy & humidity)
     h_mix = ra_frac * ra["h"] + fa_frac * fa["h"]
     W_mix = ra_frac * ra["w"] + fa_frac * fa["w"]
 
-    # Back calculate DB
     T_mix = (h_mix * 1000 - 2501000 * W_mix) / (1006 + 1860 * W_mix)
 
     wb = psychrolib.GetTWetBulbFromHumRatio(T_mix, W_mix, P_ATM)
@@ -164,3 +184,25 @@ def mixing(data: MixingInput):
         "fa_cfm": round(fa_cfm, 0),
         "mix_dh": round(h_mix - ra["h"], 2),
     }
+
+
+# =========================
+# FRONTEND FIX (IMPORTANT CHANGES ONLY)
+# =========================
+
+# Replace this in your HTML JS:
+# const API="https://your-app-name.onrender.com";
+
+# Replace ALL catch blocks with:
+# catch(e){ showError(e.message || 'Operation failed') }
+
+# Add button reset inside validation failures
+# btn.innerText='Run Analysis'; btn.disabled=false;
+
+# OPTIONAL: Add timeout
+# fetch(url, { signal: AbortSignal.timeout(5000) })
+
+# =========================
+# RUN COMMAND (RENDER)
+# =========================
+# uvicorn hvac_backend:app --host 0.0.0.0 --port 10000
